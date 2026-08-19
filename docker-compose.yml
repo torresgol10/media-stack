@@ -64,25 +64,12 @@ services:
           echo "qbit: whitelist por subred eliminada"
         fi
 
-        # La password se escribe AQUI y no desde el sidecar de wiring: qBittorrent
-        # vuelca su config en memoria al apagarse, asi que cualquier edicion hecha
-        # con el proceso vivo se pierde en el siguiente restart. init corre antes
-        # de que arranque (depends_on), asi que esto si lo lee al iniciar.
-        if [ -n "$${QBT_PASSWORD:-}" ]; then
-          apk add --no-cache python3 >/dev/null 2>&1 || true
-          H=$$(python3 - "$$QBT_PASSWORD" <<'PY'
-        import base64, hashlib, os, sys
-        salt = os.urandom(16)
-        dk = hashlib.pbkdf2_hmac("sha512", sys.argv[1].encode(), salt, 100000, 64)
-        print(base64.b64encode(salt).decode() + ":" + base64.b64encode(dk).decode())
-        PY
-        )
-          if [ -n "$$H" ]; then
-            sed -i '/^WebUI.Password_PBKDF2/d' "$$QB"
-            sed -i "/^\[Preferences\]/a WebUI\\Password_PBKDF2=\"@ByteArray($$H)\"" "$$QB"
-            echo "qbit: password de la WebUI fijada antes del arranque"
-          fi
-        fi
+        # La password de la WebUI NO se toca desde aqui a proposito. Escribir el
+        # hash PBKDF2 a mano es fragil (el escapado del backslash de la clave se
+        # pierde entre YAML, la shell y sed) y ademas qBittorrent vuelca su config
+        # en memoria al apagarse. La pone el usuario en la propia WebUI, y se
+        # replica en la variable QBT_PASSWORD para que el sidecar de wiring se la
+        # pase al download client de Sonarr y Radarr.
         chown -R "$${PUID}:$${PGID}" /config
         echo "init OK"
     networks:
