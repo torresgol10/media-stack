@@ -1,4 +1,3 @@
-name: media-stack
 
 # Stack de medios auto-hospedado, adaptado para correr detrás del Traefik de Coolify.
 #
@@ -59,6 +58,75 @@ services:
           echo "qBittorrent.conf ya existe, no se toca"
         fi
         echo "init OK"
+    networks:
+      - proxy
+
+  # === Base URLs para los subpaths ===
+  # Mismo trabajo que scripts/configure-base-urls.sh, pero editando los ficheros
+  # de config directamente en los volúmenes en vez de por `docker exec`, que no
+  # es viable dentro de Coolify. Espera a que cada app genere su config en el
+  # primer arranque, la parchea y sale. Idempotente: en los redeploys siguientes
+  # encuentra el valor ya puesto y no toca nada.
+  baseurls:
+    image: alpine:3.20
+    restart: "no"
+    volumes:
+      - sonarr_config:/cfg/sonarr
+      - radarr_config:/cfg/radarr
+      - bazarr_config:/cfg/bazarr
+      - jellyfin_config:/cfg/jellyfin
+    command:
+      - sh
+      - -c
+      - |
+        set -u
+        wait_for() {
+          f="$$1"; n=0
+          while [ ! -f "$$f" ] && [ $$n -lt 240 ]; do sleep 2; n=$$((n+1)); done
+          [ -f "$$f" ] || { echo "TIMEOUT esperando $$f"; return 1; }
+        }
+        # *arr: <UrlBase></UrlBase> en config.xml
+        for app in sonarr radarr; do
+          f="/cfg/$$app/config.xml"
+          wait_for "$$f" || continue
+          if grep -q "<UrlBase>/$$app</UrlBase>" "$$f"; then
+            echo "$$app: UrlBase ya estaba en /$$app"
+          elif grep -q "<UrlBase></UrlBase>" "$$f"; then
+            sed -i "s|<UrlBase></UrlBase>|<UrlBase>/$$app</UrlBase>|" "$$f"
+            echo "$$app: UrlBase -> /$$app"
+          else
+            echo "$$app: WARN no encontre <UrlBase></UrlBase>, revisar a mano"
+          fi
+        done
+        # Bazarr: url_base en config.yaml (la imagen LSIO lo pone en /config/config/)
+        f=/cfg/bazarr/config/config.yaml
+        if wait_for "$$f"; then
+          if grep -qE "^ *base_url: */bazarr *$$" "$$f"; then
+            echo "bazarr: base_url ya estaba en /bazarr"
+          elif grep -qE "^ *base_url:" "$$f"; then
+            sed -i "s|^\( *\)base_url:.*|\1base_url: /bazarr|" "$$f"
+            echo "bazarr: base_url -> /bazarr"
+          else
+            echo "bazarr: WARN no encontre base_url en config.yaml, ponelo a mano en Settings > General"
+          fi
+        fi
+        # Jellyfin: <BaseUrl> en network.xml, puede no existir el tag
+        f=/cfg/jellyfin/network.xml
+        if wait_for "$$f"; then
+          if grep -q "<BaseUrl>/jellyfin</BaseUrl>" "$$f"; then
+            echo "jellyfin: BaseUrl ya estaba en /jellyfin"
+          elif grep -q "<BaseUrl></BaseUrl>" "$$f"; then
+            sed -i "s|<BaseUrl></BaseUrl>|<BaseUrl>/jellyfin</BaseUrl>|" "$$f"
+            echo "jellyfin: BaseUrl -> /jellyfin"
+          elif grep -q "<BaseUrl>" "$$f"; then
+            sed -i "s|<BaseUrl>.*</BaseUrl>|<BaseUrl>/jellyfin</BaseUrl>|" "$$f"
+            echo "jellyfin: BaseUrl reemplazado por /jellyfin"
+          else
+            sed -i "s|</NetworkConfiguration>|  <BaseUrl>/jellyfin</BaseUrl>\n</NetworkConfiguration>|" "$$f"
+            echo "jellyfin: BaseUrl insertado (no existia el tag)"
+          fi
+        fi
+        echo "baseurls OK"
     networks:
       - proxy
 
