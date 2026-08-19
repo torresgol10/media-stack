@@ -152,6 +152,8 @@ services:
   jackett:
     image: lscr.io/linuxserver/jackett:latest
     restart: unless-stopped
+    expose:
+      - "9117"
     environment:
       - PUID=${PUID:-1000}
       - PGID=${PGID:-1000}
@@ -237,6 +239,8 @@ services:
   qbittorrent:
     image: lscr.io/linuxserver/qbittorrent:latest
     restart: unless-stopped
+    expose:
+      - "8080"
     environment:
       - PUID=${PUID:-1000}
       - PGID=${PGID:-1000}
