@@ -130,6 +130,98 @@ services:
     networks:
       - proxy
 
+  # === Cableado entre apps ===
+  # Lee las API keys de los volúmenes de config y hace las llamadas por la red
+  # interna, para que las claves no salgan del servidor. Idempotente: comprueba
+  # lo que ya existe antes de crear nada.
+  wiring:
+    image: alpine:3.20
+    restart: "no"
+    volumes:
+      - sonarr_config:/cfg/sonarr
+      - radarr_config:/cfg/radarr
+      - qbittorrent_config:/cfg/qbittorrent
+    command:
+      - sh
+      - -c
+      - |
+        set -u
+        apk add --no-cache curl jq >/dev/null 2>&1 || { echo "no pude instalar curl/jq"; exit 1; }
+
+        # --- 1. qBittorrent: permitir que los *arr entren sin credenciales
+        #     desde la red de Docker (la WebUI publica sigue pidiendo login).
+        QB=/cfg/qbittorrent/qBittorrent/qBittorrent.conf
+        if [ -f "$$QB" ]; then
+          if grep -q "AuthSubnetWhitelistEnabled" "$$QB"; then
+            echo "qbit: whitelist ya configurada"
+          else
+            printf '%s\n' 'WebUI\AuthSubnetWhitelistEnabled=true' 'WebUI\AuthSubnetWhitelist=172.16.0.0/12' >> "$$QB"
+            echo "qbit: whitelist de red interna añadida (necesita restart)"
+          fi
+        else
+          echo "qbit: WARN no encuentro qBittorrent.conf"
+        fi
+
+        # --- 2. API keys de Sonarr y Radarr
+        for app in sonarr radarr; do
+          f="/cfg/$$app/config.xml"; n=0
+          while [ ! -f "$$f" ] && [ $$n -lt 120 ]; do sleep 2; n=$$((n+1)); done
+        done
+        SK=$$(sed -n 's|.*<ApiKey>\(.*\)</ApiKey>.*|\1|p' /cfg/sonarr/config.xml 2>/dev/null)
+        RK=$$(sed -n 's|.*<ApiKey>\(.*\)</ApiKey>.*|\1|p' /cfg/radarr/config.xml 2>/dev/null)
+        [ -n "$$SK" ] && echo "sonarr: API key leida" || echo "sonarr: WARN sin API key"
+        [ -n "$$RK" ] && echo "radarr: API key leida" || echo "radarr: WARN sin API key"
+
+        # --- 3. qBittorrent: ruta de descarga en /data/torrents
+        QBUP=$$(curl -s -o /dev/null -w '%{http_code}' -m 10 "http://qbittorrent:8080/api/v2/app/version")
+        if [ "$$QBUP" = "200" ]; then
+          curl -s -m 10 -X POST "http://qbittorrent:8080/api/v2/app/setPreferences" \
+            --data-urlencode 'json={"save_path":"/data/torrents","temp_path_enabled":false,"auto_tmm_enabled":true}' >/dev/null
+          echo "qbit: save_path -> /data/torrents"
+        else
+          echo "qbit: aun pide auth (HTTP $$QBUP) — hace falta un restart para que aplique la whitelist"
+        fi
+
+        # --- 4. Download client y root folder en Sonarr y Radarr
+        wire() {
+          app="$$1"; port="$$2"; key="$$3"; ver="$$4"; cat_="$$5"; root="$$6"
+          [ -n "$$key" ] || return 0
+          base="http://$$app:$$port/$$app/api/$$ver"
+          n=0
+          until curl -s -o /dev/null -m 5 "$$base/system/status?apikey=$$key"; do
+            n=$$((n+1)); [ $$n -gt 60 ] && { echo "$$app: TIMEOUT esperando la API"; return 1; }; sleep 3
+          done
+          if curl -s -m 10 "$$base/downloadclient?apikey=$$key" | grep -q '"name":"qBittorrent"'; then
+            echo "$$app: download client ya existia"
+          else
+            curl -s -m 15 -X POST "$$base/downloadclient?apikey=$$key" -H "Content-Type: application/json" -d "{
+              \"enable\":true,\"protocol\":\"torrent\",\"priority\":1,
+              \"name\":\"qBittorrent\",\"implementation\":\"QBittorrent\",
+              \"configContract\":\"QBittorrentSettings\",
+              \"fields\":[
+                {\"name\":\"host\",\"value\":\"qbittorrent\"},
+                {\"name\":\"port\",\"value\":8080},
+                {\"name\":\"useSsl\",\"value\":false},
+                {\"name\":\"urlBase\",\"value\":\"\"},
+                {\"name\":\"username\",\"value\":\"\"},
+                {\"name\":\"password\",\"value\":\"\"},
+                {\"name\":\"movieCategory\",\"value\":\"$$cat_\"},
+                {\"name\":\"tvCategory\",\"value\":\"$$cat_\"}
+              ]}" >/dev/null && echo "$$app: download client qBittorrent creado (categoria $$cat_)"
+          fi
+          if curl -s -m 10 "$$base/rootfolder?apikey=$$key" | grep -q "\"path\":\"$$root\""; then
+            echo "$$app: root folder ya existia"
+          else
+            curl -s -m 15 -X POST "$$base/rootfolder?apikey=$$key" -H "Content-Type: application/json" \
+              -d "{\"path\":\"$$root\"}" >/dev/null && echo "$$app: root folder $$root creado"
+          fi
+        }
+        wire sonarr 8989 "$$SK" v3 tv-sonarr /data/media/series
+        wire radarr 7878 "$$RK" v3 radarr     /data/media/movies
+        echo "wiring OK"
+    networks:
+      - proxy
+
   # === Reverse proxy (Caddy con Caddyfile estático) ===
   # Sin `ports`: Traefik le habla por la red de Docker al puerto 80 del container.
   caddy:
