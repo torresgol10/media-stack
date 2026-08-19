@@ -31,8 +31,20 @@ log()  { printf "${GREEN}[+]${NC} %s\n" "$*"; }
 warn() { printf "${YELLOW}[!]${NC} %s\n" "$*"; }
 err()  { printf "${RED}[x]${NC} %s\n" "$*"; }
 
+# Bajo Coolify los containers no se llaman "sonarr" sino "sonarr-<uuid>", asi que
+# el nombre real se resuelve por la label que compose le pone a cada servicio.
+cname() {
+  local svc="$1" id
+  id="$(docker ps -q -f "label=com.docker.compose.service=${svc}" | head -1)"
+  if [ -z "$id" ]; then
+    err "No encuentro ningun container corriendo para el servicio '${svc}'"
+    return 1
+  fi
+  printf "%s" "$id"
+}
+
 wait_for_config() {
-  local container="$1"
+  local container; container="$(cname "$1")" || return 1
   local path="$2"
   local timeout="${3:-120}"
   log "Esperando que ${container} genere ${path}..."
@@ -49,7 +61,7 @@ wait_for_config() {
 
 set_urlbase_xml() {
   # Apps *arr: edita <UrlBase></UrlBase> en config.xml
-  local container="$1"
+  local container; container="$(cname "$1")" || return 1
   local path="$2"
   local value="$3"
   docker exec "$container" bash -c "
@@ -66,7 +78,7 @@ set_urlbase_xml() {
 
 set_baseurl_jellyfin() {
   # Jellyfin: <BaseUrl> puede no existir en network.xml, hay que insertarlo antes del cierre
-  local container="$1"
+  local container; container="$(cname "$1")" || return 1
   local path="$2"
   local value="$3"
   docker exec "$container" bash -c "
@@ -85,7 +97,7 @@ set_baseurl_jellyfin() {
 
 set_urlbase_bazarr() {
   # Bazarr: usa config.yaml, la key url_base puede no existir
-  local container="$1"
+  local container; container="$(cname "$1")" || return 1
   local path="$2"
   local value="$3"
   docker exec "$container" bash -c "
@@ -104,9 +116,10 @@ set_urlbase_bazarr() {
 
 restart_apps() {
   log "Reiniciando apps para que apliquen los nuevos URL Base..."
+  local id
   for c in "$@"; do
-    if docker ps -q -f name="^/${c}\$" >/dev/null 2>&1; then
-      docker restart "$c" >/dev/null
+    if id="$(cname "$c" 2>/dev/null)" && [ -n "$id" ]; then
+      docker restart "$id" >/dev/null
       log "  ${c}: reiniciado"
     else
       warn "  ${c}: no estaba corriendo, skip"
@@ -154,15 +167,15 @@ main() {
   echo
   log "============================================"
   log "  Listo. URLs de acceso:"
-  log "    http://<IP>/jellyfin    → Media server"
-  log "    http://<IP>/sonarr      → TV shows"
-  log "    http://<IP>/radarr      → Movies"
-  log "    http://<IP>/bazarr      → Subtitles"
-  log "    http://<IP>/jellyseerr  → Requests (si soporta subpath)"
-  log "    http://<IP>/wizarr      → Invitations (configurar manualmente)"
-  log "    http://<IP>:8080        → qBittorrent (puerto dedicado)"
-  log "    http://<IP>:9117        → Jackett (puerto dedicado)"
-  log "    http://<IP>:8191        → FlareSolverr (puerto dedicado)"
+  log "    ${PUBLIC_URL:-http://<tu-dominio>}/jellyfin    → Media server"
+  log "    ${PUBLIC_URL:-http://<tu-dominio>}/sonarr      → TV shows"
+  log "    ${PUBLIC_URL:-http://<tu-dominio>}/radarr      → Movies"
+  log "    ${PUBLIC_URL:-http://<tu-dominio>}/bazarr      → Subtitles"
+  log "    ${PUBLIC_URL:-http://<tu-dominio>}/jellyseerr  → Requests"
+  log "    ${PUBLIC_URL:-http://<tu-dominio>}/wizarr      → Invitations (configurar manualmente)"
+  log ""
+  log "  qBittorrent y Jackett salen por su propio subdominio en Traefik."
+  log "  FlareSolverr no se expone: solo lo consume Jackett desde la red interna."
   log "============================================"
 }
 
