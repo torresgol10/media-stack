@@ -132,11 +132,16 @@ services:
 
   # === Cableado entre apps ===
   # Lee las API keys de los volúmenes de config y hace las llamadas por la red
-  # interna, para que las claves no salgan del servidor. Idempotente: comprueba
-  # lo que ya existe antes de crear nada.
+  # interna, para que las claves no salgan del servidor. Idempotente.
+  #
+  # NO usar AuthSubnetWhitelist en qBittorrent: Traefik proxea desde la misma
+  # subred de Docker, asi que whitelistearla deja la WebUI publica sin login.
+  # En su lugar se fija una password real (QBT_PASSWORD) y se le pasa a los *arr.
   wiring:
     image: alpine:3.20
     restart: "no"
+    environment:
+      - QBT_PASSWORD=${QBT_PASSWORD:-}
     volumes:
       - sonarr_config:/cfg/sonarr
       - radarr_config:/cfg/radarr
@@ -146,23 +151,38 @@ services:
       - -c
       - |
         set -u
-        apk add --no-cache curl jq >/dev/null 2>&1 || { echo "no pude instalar curl/jq"; exit 1; }
+        apk add --no-cache curl python3 >/dev/null 2>&1 || { echo "no pude instalar deps"; exit 1; }
 
-        # --- 1. qBittorrent: permitir que los *arr entren sin credenciales
-        #     desde la red de Docker (la WebUI publica sigue pidiendo login).
         QB=/cfg/qbittorrent/qBittorrent/qBittorrent.conf
-        if [ -f "$$QB" ]; then
-          if grep -q "AuthSubnetWhitelistEnabled" "$$QB"; then
-            echo "qbit: whitelist ya configurada"
-          else
-            printf '%s\n' 'WebUI\AuthSubnetWhitelistEnabled=true' 'WebUI\AuthSubnetWhitelist=172.16.0.0/12' >> "$$QB"
-            echo "qbit: whitelist de red interna añadida (necesita restart)"
-          fi
-        else
-          echo "qbit: WARN no encuentro qBittorrent.conf"
+        PW="$${QBT_PASSWORD:-}"
+
+        # --- 1. Quitar la whitelist por subred si la puso una version anterior:
+        #     Traefik sale de esa misma subred y dejaria la WebUI publica abierta.
+        if [ -f "$$QB" ] && grep -q "AuthSubnetWhitelist" "$$QB"; then
+          sed -i '/AuthSubnetWhitelist/d' "$$QB"
+          echo "qbit: whitelist por subred ELIMINADA (dejaba la WebUI publica sin login)"
         fi
 
-        # --- 2. API keys de Sonarr y Radarr
+        # --- 2. Fijar la password de la WebUI (PBKDF2-HMAC-SHA512, como la guarda qBittorrent)
+        if [ -f "$$QB" ] && [ -n "$$PW" ]; then
+          H=$$(python3 - "$$PW" <<'PY'
+        import base64, hashlib, os, sys
+        salt = os.urandom(16)
+        dk = hashlib.pbkdf2_hmac("sha512", sys.argv[1].encode(), salt, 100000, 64)
+        print(base64.b64encode(salt).decode() + ":" + base64.b64encode(dk).decode())
+        PY
+        )
+          if [ -n "$$H" ]; then
+            sed -i '/^WebUI\Password_PBKDF2/d' "$$QB"
+            sed -i "/^\[Preferences\]/a WebUI\\Password_PBKDF2=\"@ByteArray($$H)\"" "$$QB"
+            grep -q "^\[Preferences\]" "$$QB" || printf '%s\n' '[Preferences]' "WebUI\Password_PBKDF2=\"@ByteArray($$H)\"" >> "$$QB"
+            echo "qbit: password de la WebUI fijada desde QBT_PASSWORD (necesita restart)"
+          fi
+        elif [ -z "$$PW" ]; then
+          echo "qbit: QBT_PASSWORD vacia, no toco la password"
+        fi
+
+        # --- 3. API keys de Sonarr y Radarr
         for app in sonarr radarr; do
           f="/cfg/$$app/config.xml"; n=0
           while [ ! -f "$$f" ] && [ $$n -lt 120 ]; do sleep 2; n=$$((n+1)); done
@@ -172,21 +192,24 @@ services:
         [ -n "$$SK" ] && echo "sonarr: API key leida" || echo "sonarr: WARN sin API key"
         [ -n "$$RK" ] && echo "radarr: API key leida" || echo "radarr: WARN sin API key"
 
-        # --- 3. qBittorrent: ruta de descarga en /data/torrents
-        QBUP=$$(curl -s -o /dev/null -w '%{http_code}' -m 10 "http://qbittorrent:8080/api/v2/app/version")
-        if [ "$$QBUP" = "200" ]; then
-          curl -s -m 10 -X POST "http://qbittorrent:8080/api/v2/app/setPreferences" \
-            --data-urlencode 'json={"save_path":"/data/torrents","temp_path_enabled":false,"auto_tmm_enabled":true}' >/dev/null
-          echo "qbit: save_path -> /data/torrents"
+        # --- 4. qBittorrent: ruta de descarga (requiere login ya con la password nueva)
+        CJ=/tmp/qb.cookie
+        LOGIN=$$(curl -s -o /dev/null -w '%{http_code}' -m 10 -c "$$CJ" \
+          --data-urlencode "username=admin" --data-urlencode "password=$$PW" \
+          "http://qbittorrent:8080/api/v2/auth/login")
+        if [ "$$LOGIN" = "200" ]; then
+          curl -s -m 10 -b "$$CJ" -X POST "http://qbittorrent:8080/api/v2/app/setPreferences" \
+            --data-urlencode 'json={"save_path":"/data/torrents","auto_tmm_enabled":true}' >/dev/null
+          echo "qbit: login OK, save_path -> /data/torrents"
         else
-          echo "qbit: aun pide auth (HTTP $$QBUP) — hace falta un restart para que aplique la whitelist"
+          echo "qbit: login devolvio $$LOGIN — si es la primera pasada, hace falta un restart para que aplique la password"
         fi
 
-        # --- 4. Download client y root folder en Sonarr y Radarr
+        # --- 5. Download client y root folder en Sonarr y Radarr
         wire() {
-          app="$$1"; port="$$2"; key="$$3"; ver="$$4"; cat_="$$5"; root="$$6"
+          app="$$1"; port="$$2"; key="$$3"; cat_="$$4"; root="$$5"
           [ -n "$$key" ] || return 0
-          base="http://$$app:$$port/$$app/api/$$ver"
+          base="http://$$app:$$port/$$app/api/v3"
           n=0
           until curl -s -o /dev/null -m 5 "$$base/system/status?apikey=$$key"; do
             n=$$((n+1)); [ $$n -gt 60 ] && { echo "$$app: TIMEOUT esperando la API"; return 1; }; sleep 3
@@ -203,8 +226,8 @@ services:
                 {\"name\":\"port\",\"value\":8080},
                 {\"name\":\"useSsl\",\"value\":false},
                 {\"name\":\"urlBase\",\"value\":\"\"},
-                {\"name\":\"username\",\"value\":\"\"},
-                {\"name\":\"password\",\"value\":\"\"},
+                {\"name\":\"username\",\"value\":\"admin\"},
+                {\"name\":\"password\",\"value\":\"$$PW\"},
                 {\"name\":\"movieCategory\",\"value\":\"$$cat_\"},
                 {\"name\":\"tvCategory\",\"value\":\"$$cat_\"}
               ]}" >/dev/null && echo "$$app: download client qBittorrent creado (categoria $$cat_)"
@@ -216,8 +239,8 @@ services:
               -d "{\"path\":\"$$root\"}" >/dev/null && echo "$$app: root folder $$root creado"
           fi
         }
-        wire sonarr 8989 "$$SK" v3 tv-sonarr /data/media/series
-        wire radarr 7878 "$$RK" v3 radarr     /data/media/movies
+        wire sonarr 8989 "$$SK" tv-sonarr /data/media/series
+        wire radarr 7878 "$$RK" radarr    /data/media/movies
         echo "wiring OK"
     networks:
       - proxy
