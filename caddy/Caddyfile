@@ -1,3 +1,7 @@
+# NOTA: bajo Coolify el Caddyfile que manda es el bloque inline del
+# docker-compose.yml (servicio `caddy`). Este fichero es la copia legible del
+# upstream: si tocás uno, tocá el otro.
+
 {
     # Sin dominio real, sólo HTTP en :80 para el demo.
     auto_https off
